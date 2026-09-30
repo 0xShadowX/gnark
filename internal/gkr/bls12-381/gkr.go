@@ -32,6 +32,27 @@ type WireAssignment []polynomial.MultiLin
 
 type Proof []sumcheckProof // for each layer, for each wire, a sumcheck (for each variable, a polynomial)
 
+// EvaluationClaim is an assertion that a wire's multilinear extension evaluates to Evaluation at
+// EvaluationPoint.
+type EvaluationClaim = gkrcore.EvaluationClaim[fr.Element]
+
+// Claims are the evaluation claims on circuit inputs and outputs that Prove and Verify return, by
+// wire. The consumption order within a wire's slice is up to the caller.
+type Claims map[int][]EvaluationClaim
+
+// Check asserts that every claim in c holds against assignment.
+func (c Claims) Check(assignment WireAssignment) error {
+	for wI, wireClaims := range c {
+		for _, claim := range wireClaims {
+			eval := assignment[wI].Evaluate(claim.EvaluationPoint, nil)
+			if !eval.Equal(&claim.Evaluation) {
+				return fmt.Errorf("wire %d: claimed evaluation %v, computed %v", wI, &claim.Evaluation, &eval)
+			}
+		}
+	}
+	return nil
+}
+
 type resources struct {
 	// outgoingEvalPoints[i][k] is the k-th outgoing evaluation point (evaluation challenge) produced at schedule level i.
 	// outgoingEvalPoints[len(schedule)][0] holds the initial challenge (firstChallenge / rho).
@@ -44,29 +65,30 @@ type resources struct {
 	circuit            Circuit
 	schedule           constraint.GkrProvingSchedule
 	transcript         transcript
-	uniqueInputIndices [][]int // uniqueInputIndices[wI][claimI]: w's unique-input index in the layer its claimI-th evaluation is coming from
-	wireLevels         []constraint.GkrProvingLevel
+	claimValueIndices  [][]int // claimValueIndices[wI][claimI]: index of w's claimI-th claimed value in its source level's finalEvalProof
+	claims             Claims
+	consolidated       []bool // the wires of schedule[0], indexed by wire
 }
 
-func newResources(c Circuit, schedule constraint.GkrProvingSchedule, assignment WireAssignment, hasher hash.Hash) (resources, error) {
-	nbVars := assignment.NumVars()
-	nbInstances := assignment.NumInstances()
-	if 1<<nbVars != nbInstances {
-		return resources{}, errors.New("number of instances must be power of 2")
-	}
+// identityGate is the identity gate LevelCircuit and ConsolidationView use to build level 0's
+// view of the circuit.
+func identityGate() gkrcore.SerializableGate {
+	return gkrcore.SerializableGate{Evaluate: gkrcore.IdentityBytecode(), NbIn: 1, Degree: 1}
+}
 
+// newResources builds the resources shared by Prove and Verify. It takes no assignment and
+// creates no pools; Prove sets those up separately afterward, since Verify needs neither.
+func newResources(c Circuit, schedule constraint.GkrProvingSchedule, nbVars int, hasher hash.Hash) resources {
 	return resources{
 		outgoingEvalPoints: make([][][]fr.Element, len(schedule)+1),
 		nbVars:             nbVars,
-		assignment:         assignment,
-		memPool:            polynomial.NewPool(c.MemoryRequirements(nbInstances)...),
-		workers:            utils.NewWorkerPool(),
 		circuit:            c,
 		schedule:           schedule,
 		transcript:         transcript{h: hasher},
-		uniqueInputIndices: c.UniqueInputIndices(schedule),
-		wireLevels:         schedule.WireLevels(len(c)),
-	}, nil
+		claimValueIndices:  c.ClaimValueIndices(schedule),
+		claims:             make(Claims),
+		consolidated:       c.LevelWires(schedule[0]),
+	}
 }
 
 // proveSkipLevel evaluates each unique gate input at each inherited evaluation point and records
@@ -85,115 +107,199 @@ func (r *resources) proveSkipLevel(levelI int) sumcheckProof {
 	return sumcheckProof{finalEvalProof: evals}
 }
 
-// verifySkipLevel verifies a SkipSumcheck level: checks that the finalEvalProof
-// is consistent with the assignment and gate evaluations, and records outgoing eval points.
+// verifySkipLevel verifies a SkipSumcheck level: checks that the finalEvalProof is consistent with
+// the gate evaluations, and records outgoing eval points.
 func (r *resources) verifySkipLevel(levelI int, proof Proof) error {
 	level := r.schedule[levelI].(*constraint.GkrSkipLevel)
-	outPoints := gkrcore.CollectOutgoingEvalPoints(level, levelI, r.outgoingEvalPoints)
+	gkrcore.CollectOutgoingEvalPoints(level, levelI, r.outgoingEvalPoints)
 
 	finalEval := proof[levelI].finalEvalProof
 	_, inputIndices := r.circuit.InputMapping(level)
 	group := constraint.GkrClaimGroup(*level)
-	initialChallengeI := len(r.schedule)
 
 	for levelWireI, wI := range group.Wires {
 		wire := r.circuit[wI]
 		evaluator := newGateEvaluator(wire.Gate.Evaluate, len(wire.Inputs))
 		for claimI, src := range group.ClaimSources {
-			point := outPoints[claimI]
-			var gateEval fr.Element
-			if wire.IsInput() {
-				gateEval = r.assignment[wI].Evaluate(point, &r.memPool)
-				if claimed := finalEval[level.FinalEvalProofIndex(inputIndices[levelWireI][0], claimI)]; !claimed.Equal(&gateEval) {
-					return fmt.Errorf("level %d wire %d: finalEvalProof[%d] = %v, want %v", levelI, wI, level.FinalEvalProofIndex(inputIndices[levelWireI][0], claimI), &claimed, &gateEval)
-				}
-			} else {
-				for _, inI := range inputIndices[levelWireI] {
-					evaluator.pushInput(finalEval[level.FinalEvalProofIndex(inI, claimI)])
-				}
-				gateEval.Set(evaluator.evaluate())
+			for _, inI := range inputIndices[levelWireI] {
+				evaluator.pushInput(finalEval[level.FinalEvalProofIndex(inI, claimI)])
 			}
-			var claimedEval fr.Element
-			if src.Level == initialChallengeI {
-				claimedEval = r.assignment[wI].Evaluate(point, &r.memPool)
-			} else {
-				claimedEval = proof[src.Level].finalEvalProof[r.schedule[src.Level].FinalEvalProofIndex(r.uniqueInputIndices[wI][claimI], src.OutgoingClaimIndex)]
-			}
-			if !claimedEval.Equal(&gateEval) {
-				return fmt.Errorf("level %d wire %d claim %d: claimed eval %v disagrees with gate eval %v", levelI, wI, claimI, &claimedEval, &gateEval)
+			gateEval := evaluator.evaluate()
+			claimedEval := proof[src.Level].finalEvalProof[r.claimValueIndices[wI][claimI]]
+			if !claimedEval.Equal(gateEval) {
+				return fmt.Errorf("level %d wire %d claim %d: claimed eval %v disagrees with gate eval %v", levelI, wI, claimI, &claimedEval, gateEval)
 			}
 		}
 	}
 	return nil
 }
 
-// Prove consistency of the claimed assignment
-func Prove(c Circuit, schedule constraint.GkrProvingSchedule, assignment WireAssignment, hasher hash.Hash) (Proof, error) {
-	r, err := newResources(c, schedule, assignment, hasher)
+// levelPredicates returns the bind and include predicates for level levelI's unique gate inputs.
+// Level 0 binds nothing and returns every one of its wires (self-referencing on the consolidation
+// view); every other level binds every unique gate input that is not an unconsolidated circuit
+// input, and returns claims for exactly those it withholds from binding.
+func (r *resources) levelPredicates(levelI int) (bind, include func(wI int) bool) {
+	if levelI == 0 {
+		return func(int) bool { return false }, func(int) bool { return true }
+	}
+	return func(wI int) bool { return !r.circuit.IsInput(wI) || r.consolidated[wI] },
+		func(wI int) bool { return r.circuit.IsInput(wI) && !r.consolidated[wI] }
+}
+
+// proveLevel proves level levelI: computes its proof entry, binds its values, and appends its claims.
+func (r *resources) proveLevel(levelI int) sumcheckProof {
+	var entry sumcheckProof
+	switch r.schedule[levelI].(type) {
+	case *constraint.GkrSkipLevel:
+		entry = r.proveSkipLevel(levelI)
+	case *constraint.GkrSingleSourceZeroCheckLevel:
+		entry = r.proveSingleSourceZeroCheckLevel(levelI)
+	case *constraint.GkrSumcheckLevel:
+		entry = r.proveSumcheckLevel(levelI)
+	default:
+		panic(fmt.Sprintf("level %d: unknown proving level type %T", levelI, r.schedule[levelI]))
+	}
+	bind, include := r.levelPredicates(levelI)
+	constraint.BindGkrFinalEvalProof(&r.transcript, entry.finalEvalProof, r.circuit.UniqueGateInputs(r.schedule[levelI]), bind, r.schedule[levelI])
+	gkrcore.AppendLevelClaims(r.claims, r.circuit, r.schedule[levelI], entry.finalEvalProof, r.outgoingEvalPoints[levelI], include)
+	return entry
+}
+
+// Prove consistency of the claimed assignment. It returns the evaluation claims on the circuit's
+// inputs and outputs; the caller must check them. The claim values returned to the caller, the
+// output evaluations among them, are not bound into the transcript.
+func Prove(c Circuit, schedule constraint.GkrProvingSchedule, assignment WireAssignment, hasher hash.Hash) (Proof, Claims, error) {
+	nbInstances := assignment.NumInstances()
+	nbVars := assignment.NumVars()
+	if 1<<nbVars != nbInstances {
+		return nil, nil, errors.New("number of instances must be power of 2")
+	}
+
+	r := newResources(c, schedule, nbVars, hasher)
+	r.assignment = assignment
+	r.memPool = polynomial.NewPool(gkrcore.MemoryRequirements(c, nbInstances)...)
+	r.workers = utils.NewWorkerPool()
+	defer r.workers.Stop()
+
+	proof := make(Proof, len(schedule)+1)
+
+	// Derive the initial challenge point
+	firstChallenge := make([]fr.Element, r.nbVars)
+	for j := range r.nbVars {
+		firstChallenge[j] = r.transcript.getChallenge()
+	}
+	r.outgoingEvalPoints[len(schedule)] = [][]fr.Element{firstChallenge}
+
+	outputs := c.Outputs()
+	outputEvals := make([]fr.Element, len(outputs))
+	for i, w := range outputs {
+		outputEvals[i] = r.assignment[w].Evaluate(firstChallenge, &r.memPool)
+	}
+	proof[len(schedule)] = sumcheckProof{finalEvalProof: outputEvals}
+	var boundOutputEvals []fr.Element
+	for i, w := range outputs {
+		if r.consolidated[w] {
+			boundOutputEvals = append(boundOutputEvals, outputEvals[i])
+		}
+	}
+	r.transcript.Bind(boundOutputEvals...)
+	gkrcore.AppendOutputClaims(r.claims, c, firstChallenge, outputEvals, func(wI int) bool { return !r.consolidated[wI] })
+
+	for levelI := len(schedule) - 1; levelI >= 1; levelI-- {
+		proof[levelI] = r.proveLevel(levelI)
+	}
+	r.circuit = r.circuit.LevelCircuit(r.schedule, 0, identityGate())
+	proof[0] = r.proveLevel(0)
+
+	return proof, r.claims, nil
+}
+
+// verifyLevel verifies level levelI: checks its proof entry, binds its values, and appends its claims.
+func (r *resources) verifyLevel(levelI int, proof Proof) error {
+	var err error
+	switch r.schedule[levelI].(type) {
+	case *constraint.GkrSkipLevel:
+		err = r.verifySkipLevel(levelI, proof)
+	case *constraint.GkrSingleSourceZeroCheckLevel:
+		err = r.verifySingleSourceZeroCheckLevel(levelI, proof)
+	case *constraint.GkrSumcheckLevel:
+		err = r.verifySumcheckLevel(levelI, proof)
+	default:
+		panic(fmt.Sprintf("level %d: unknown proving level type %T", levelI, r.schedule[levelI]))
+	}
 	if err != nil {
+		return fmt.Errorf("level %d: %v", levelI, err)
+	}
+	bind, include := r.levelPredicates(levelI)
+	constraint.BindGkrFinalEvalProof(&r.transcript, proof[levelI].finalEvalProof, r.circuit.UniqueGateInputs(r.schedule[levelI]), bind, r.schedule[levelI])
+	gkrcore.AppendLevelClaims(r.claims, r.circuit, r.schedule[levelI], proof[levelI].finalEvalProof, r.outgoingEvalPoints[levelI], include)
+	return nil
+}
+
+// Verify the consistency of the claimed output with the claimed input, and return the evaluation
+// claims on the circuit's inputs and outputs. A nil error means nothing until the returned Claims
+// are checked: Verify reads no assignment, so the caller must call Claims.Check itself. The claim
+// values returned to the caller, the output evaluations among them, are not bound into the
+// transcript.
+func Verify(c Circuit, schedule constraint.GkrProvingSchedule, logNbInstances int, proof Proof, hasher hash.Hash) (Claims, error) {
+	r := newResources(c, schedule, logNbInstances, hasher)
+
+	if len(proof) != len(schedule)+1 {
+		return nil, fmt.Errorf("proof has %d levels, expected %d", len(proof), len(schedule)+1)
+	}
+	outputLevel := proof[len(schedule)]
+	if len(outputLevel.partialSumPolys) != 0 {
+		return nil, errors.New("output level has partial sum polynomials")
+	}
+	if len(outputLevel.finalEvalProof) != len(c.Outputs()) {
+		return nil, fmt.Errorf("output level has %d evaluations, expected %d", len(outputLevel.finalEvalProof), len(c.Outputs()))
+	}
+
+	view := c.LevelCircuit(schedule, 0, identityGate())
+	for levelI, level := range schedule {
+		levelCircuit := c
+		if levelI == 0 {
+			levelCircuit = view
+		}
+		nbUniqueInputs := len(levelCircuit.UniqueGateInputs(level))
+		wantFinalEvalLen := nbUniqueInputs * level.NbOutgoingEvalPoints()
+		if len(proof[levelI].finalEvalProof) != wantFinalEvalLen {
+			return nil, fmt.Errorf("level %d: got %d final evaluations, expected %d", levelI, len(proof[levelI].finalEvalProof), wantFinalEvalLen)
+		}
+		if _, isSkip := level.(*constraint.GkrSkipLevel); isSkip {
+			if len(proof[levelI].partialSumPolys) != 0 {
+				return nil, fmt.Errorf("level %d: skip level has partial sum polynomials", levelI)
+			}
+		} else if len(proof[levelI].partialSumPolys) != logNbInstances {
+			return nil, fmt.Errorf("level %d: got %d partial sum polynomials, expected %d", levelI, len(proof[levelI].partialSumPolys), logNbInstances)
+		}
+	}
+
+	// Derive the initial challenge point
+	firstChallenge := make([]fr.Element, r.nbVars)
+	for j := range r.nbVars {
+		firstChallenge[j] = r.transcript.getChallenge()
+	}
+	r.outgoingEvalPoints[len(schedule)] = [][]fr.Element{firstChallenge}
+	var boundOutputEvals []fr.Element
+	for i, w := range c.Outputs() {
+		if r.consolidated[w] {
+			boundOutputEvals = append(boundOutputEvals, outputLevel.finalEvalProof[i])
+		}
+	}
+	r.transcript.Bind(boundOutputEvals...)
+	gkrcore.AppendOutputClaims(r.claims, c, firstChallenge, outputLevel.finalEvalProof, func(wI int) bool { return !r.consolidated[wI] })
+
+	for levelI := len(schedule) - 1; levelI >= 1; levelI-- {
+		if err := r.verifyLevel(levelI, proof); err != nil {
+			return nil, err
+		}
+	}
+	r.circuit = view
+	if err := r.verifyLevel(0, proof); err != nil {
 		return nil, err
 	}
-	defer r.workers.Stop()
-
-	proof := make(Proof, len(schedule))
-
-	// Derive the initial challenge point
-	firstChallenge := make([]fr.Element, r.nbVars)
-	for j := range r.nbVars {
-		firstChallenge[j] = r.transcript.getChallenge()
-	}
-	r.outgoingEvalPoints[len(schedule)] = [][]fr.Element{firstChallenge}
-
-	for levelI := len(schedule) - 1; levelI >= 0; levelI-- {
-		switch r.schedule[levelI].(type) {
-		case *constraint.GkrSkipLevel:
-			proof[levelI] = r.proveSkipLevel(levelI)
-		case *constraint.GkrSingleSourceZeroCheckLevel:
-			proof[levelI] = r.proveSingleSourceZeroCheckLevel(levelI)
-		case *constraint.GkrSumcheckLevel:
-			proof[levelI] = r.proveSumcheckLevel(levelI)
-		default:
-			panic(fmt.Sprintf("level %d: unknown proving level type %T", levelI, r.schedule[levelI]))
-		}
-		constraint.BindGkrFinalEvalProof(&r.transcript, proof[levelI].finalEvalProof, c.UniqueGateInputs(r.schedule[levelI]), c.IsInput, r.schedule[levelI], r.wireLevels)
-	}
-
-	return proof, nil
-}
-
-// Verify the consistency of the claimed output with the claimed input.
-// Unlike in Prove, the assignment argument need not be complete.
-func Verify(c Circuit, schedule constraint.GkrProvingSchedule, assignment WireAssignment, proof Proof, hasher hash.Hash) error {
-	r, err := newResources(c, schedule, assignment, hasher)
-	if err != nil {
-		return err
-	}
-	defer r.workers.Stop()
-
-	// Derive the initial challenge point
-	firstChallenge := make([]fr.Element, r.nbVars)
-	for j := range r.nbVars {
-		firstChallenge[j] = r.transcript.getChallenge()
-	}
-	r.outgoingEvalPoints[len(schedule)] = [][]fr.Element{firstChallenge}
-
-	for levelI := len(schedule) - 1; levelI >= 0; levelI-- {
-		switch r.schedule[levelI].(type) {
-		case *constraint.GkrSkipLevel:
-			err = r.verifySkipLevel(levelI, proof)
-		case *constraint.GkrSingleSourceZeroCheckLevel:
-			err = r.verifySingleSourceZeroCheckLevel(levelI, proof)
-		case *constraint.GkrSumcheckLevel:
-			err = r.verifySumcheckLevel(levelI, proof)
-		default:
-			panic(fmt.Sprintf("level %d: unknown proving level type %T", levelI, r.schedule[levelI]))
-		}
-		if err != nil {
-			return fmt.Errorf("level %d: %v", levelI, err)
-		}
-		constraint.BindGkrFinalEvalProof(&r.transcript, proof[levelI].finalEvalProof, c.UniqueGateInputs(r.schedule[levelI]), c.IsInput, r.schedule[levelI], r.wireLevels)
-	}
-	return nil
+	return r.claims, nil
 }
 
 // Complete the circuit evaluation from input values
@@ -227,14 +333,18 @@ func (a WireAssignment) Complete(circuit Circuit) WireAssignment {
 
 func (a WireAssignment) NumInstances() int {
 	for _, aW := range a {
-		return len(aW)
+		if aW != nil {
+			return len(aW)
+		}
 	}
 	panic("empty assignment")
 }
 
 func (a WireAssignment) NumVars() int {
 	for _, aW := range a {
-		return aW.NumVars()
+		if aW != nil {
+			return aW.NumVars()
+		}
 	}
 	panic("empty assignment")
 }
@@ -282,9 +392,9 @@ func newGateEvaluator(gate gkrcore.GateBytecode, nbIn int, elementPool ...*polyn
 		nbIn: nbIn,
 	}
 	if len(elementPool) > 0 {
-		e.vars = elementPool[0].Make(gate.NbConstants() + nbIn + len(gate.Instructions))
+		e.vars = elementPool[0].Make(gate.EvaluatorSize(nbIn))
 	} else {
-		e.vars = make([]fr.Element, gate.NbConstants()+nbIn+len(gate.Instructions))
+		e.vars = make([]fr.Element, gate.EvaluatorSize(nbIn))
 	}
 	e.vars = e.vars[:gate.NbConstants()]
 	for i, constVal := range gate.Constants {

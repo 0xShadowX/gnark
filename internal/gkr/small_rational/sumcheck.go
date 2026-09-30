@@ -142,12 +142,9 @@ func (e *zeroCheckLazyClaims) degree(int) int {
 // claims on each wire and c is foldingCoeff.
 // Both purportedValue and the vector r have been randomized during sumcheck.
 //
-// For input wires, w(r) is computed directly from the assignment and the claimed
-// evaluation in uniqueInputEvaluations is checked equal to it.
-// For non-input wires, the prover claims evaluations of their gate inputs at r via
-// uniqueInputEvaluations; those claims are verified by lower levels' sumchecks.
-// The verifier checks consistency by evaluating gateᵥ(inputEvals...) and confirming
-// that the full sum matches purportedValue.
+// The prover claims evaluations of each wire's gate inputs at r via uniqueInputEvaluations; those
+// claims are verified by lower levels' sumchecks. The verifier checks consistency by evaluating
+// gateᵥ(inputEvals...) and confirming that the full sum matches purportedValue.
 func (e *zeroCheckLazyClaims) verifyFinalEval(r []small_rational.SmallRational, purportedValue small_rational.SmallRational, uniqueInputEvaluations []small_rational.SmallRational) error {
 	e.resources.outgoingEvalPoints[e.levelI] = [][]small_rational.SmallRational{r}
 	level := e.resources.schedule[e.levelI]
@@ -159,24 +156,16 @@ func (e *zeroCheckLazyClaims) verifyFinalEval(r []small_rational.SmallRational, 
 		for _, wI := range group.Wires {
 			wire := e.resources.circuit[wI]
 
-			var gateEval small_rational.SmallRational
-			if wire.IsInput() {
-				gateEval = e.resources.assignment[wI].Evaluate(r, &e.resources.memPool)
-				if !gateInputEvals[levelWireI][0].Equal(&gateEval) {
-					return errors.New("incompatible evaluations")
-				}
-			} else {
-				evaluator := newGateEvaluator(wire.Gate.Evaluate, len(wire.Inputs))
-				for _, v := range gateInputEvals[levelWireI] {
-					evaluator.pushInput(v)
-				}
-				gateEval.Set(evaluator.evaluate())
+			evaluator := newGateEvaluator(wire.Gate.Evaluate, len(wire.Inputs))
+			for _, v := range gateInputEvals[levelWireI] {
+				evaluator.pushInput(v)
 			}
+			gateEval := evaluator.evaluate()
 
 			for _, src := range group.ClaimSources {
 				eq := polynomial.EvalEq(e.resources.outgoingEvalPoints[src.Level][src.OutgoingClaimIndex], r)
 				var term small_rational.SmallRational
-				term.Mul(&eq, &gateEval)
+				term.Mul(&eq, gateEval)
 				claimedEvals = append(claimedEvals, term)
 			}
 			levelWireI++
@@ -415,11 +404,7 @@ func (c *zeroCheckBase) init(r *resources, levelI int) {
 	for _, group := range level.ClaimGroups() {
 		for _, wI := range group.Wires {
 			wire := r.circuit[wI]
-			gate := wire.Gate.Evaluate
-			if wire.IsInput() {
-				gate = gkrcore.IdentityBytecode()
-			}
-			c.gateEvaluatorPools[levelWireI] = newGateEvaluatorPool(gate, len(inputIndices[levelWireI]), &r.memPool)
+			c.gateEvaluatorPools[levelWireI] = newGateEvaluatorPool(wire.Gate.Evaluate, len(inputIndices[levelWireI]), &r.memPool)
 			levelWireI++
 		}
 	}
@@ -488,16 +473,11 @@ func (r *resources) verifyLevelSetup(levelI int, proof Proof) (small_rational.Sm
 		foldingCoeff = r.transcript.getChallenge()
 	}
 
-	initialChallengeI := len(r.schedule)
 	claimedEvals := make(polynomial.Polynomial, 0, level.NbClaims())
 	for _, group := range level.ClaimGroups() {
 		for _, wI := range group.Wires {
 			for claimI, src := range group.ClaimSources {
-				if src.Level == initialChallengeI {
-					claimedEvals = append(claimedEvals, r.assignment[wI].Evaluate(r.outgoingEvalPoints[src.Level][src.OutgoingClaimIndex], &r.memPool))
-				} else {
-					claimedEvals = append(claimedEvals, proof[src.Level].finalEvalProof[r.schedule[src.Level].FinalEvalProofIndex(r.uniqueInputIndices[wI][claimI], src.OutgoingClaimIndex)])
-				}
+				claimedEvals = append(claimedEvals, proof[src.Level].finalEvalProof[r.claimValueIndices[wI][claimI]])
 			}
 		}
 	}
