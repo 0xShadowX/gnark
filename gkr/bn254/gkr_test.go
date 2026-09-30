@@ -15,16 +15,16 @@ import (
 	"time"
 
 	"github.com/consensys/gnark-crypto/ecc"
-	"github.com/consensys/gnark-crypto/ecc/bls12-377/fr"
-	"github.com/consensys/gnark-crypto/ecc/bls12-377/fr/mimc"
-	"github.com/consensys/gnark-crypto/ecc/bls12-377/fr/polynomial"
+	"github.com/consensys/gnark-crypto/ecc/bn254/fr"
+	"github.com/consensys/gnark-crypto/ecc/bn254/fr/mimc"
+	"github.com/consensys/gnark-crypto/ecc/bn254/fr/polynomial"
 	"github.com/consensys/gnark/constraint"
 	"github.com/consensys/gnark/internal/gkr/gkrcore"
 	"github.com/consensys/gnark/internal/gkr/gkrtesting"
 	"github.com/stretchr/testify/assert"
 )
 
-var cache = gkrtesting.NewCache(ecc.BLS12_377.ScalarField())
+var cache = gkrtesting.NewCache(ecc.BN254.ScalarField())
 
 func TestNoGateTwoInstances(t *testing.T) {
 	// Testing a single instance is not possible because the sumcheck implementation doesn't cover the trivial 0-variate case
@@ -73,7 +73,7 @@ func TestPoseidon2(t *testing.T) {
 
 // proveAndVerify proves and verifies assignment against schedule, then asserts that: every wire of
 // schedule[0] has exactly one claim, and all of them share one point; the number of
-// elements in the proof, counted with proof.flatten(), equals c.ProofSize(schedule, logNbInstances);
+// elements in the proof, counted with proof.Flatten(), equals c.ProofSize(schedule, logNbInstances);
 // tampering instance 0 of any wire with claims makes Check fail; a bad hash makes Verify or Check
 // fail; and tampering the first element of any finalEvalProof or partial sum polynomial in the
 // proof, the output entry included, makes Verify reject it — except for the claimed evaluation of
@@ -107,7 +107,7 @@ func proveAndVerify(t *testing.T, c Circuit, schedule constraint.GkrProvingSched
 	}
 
 	var nbProofElems int
-	for range proof.flatten() {
+	for range proof.Flatten() {
 		nbProofElems++
 	}
 	assert.Equal(t, c.ProofSize(schedule, logNbInstances), nbProofElems)
@@ -237,7 +237,7 @@ func generateTestVerifier(path string) func(t *testing.T) {
 }
 
 func TestGkrVectors(t *testing.T) {
-	const testDirPath = "../test_vectors/"
+	const testDirPath = "../../internal/gkr/test_vectors/"
 	dirEntries, err := os.ReadDir(testDirPath)
 	assert.NoError(t, err)
 	for _, dirEntry := range dirEntries {
